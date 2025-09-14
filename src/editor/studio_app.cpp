@@ -1174,7 +1174,7 @@ struct StudioAppImpl final : StudioApp {
 
 		ImGuiIO& io = ImGui::GetIO();
 
-		updateIMGUIMonitors();
+		
 		const os::Point client_size = os::getWindowClientSize(m_main_window);
 		if (client_size.x > 0 && client_size.y > 0) {
 			io.DisplaySize = ImVec2(float(client_size.x), float(client_size.y));
@@ -1701,9 +1701,10 @@ struct StudioAppImpl final : StudioApp {
 		const char* last = reverseFind(node->label, '/');
 		last = last ? last + 1 : node->label;
 		if (last[0] == ' ') ++last;
-		if (ImGui::BeginMenu(last)) {
-			showAddComponentNode(node->child, filter, parent, editor);
-			ImGui::EndMenu();
+		if (ImGui::MenuItem(last)) {
+			node->plugin->onGUI(true, false, parent, editor);
+			showAddComponentNode(node->next, filter, parent, editor);
+			return;
 		}
 		showAddComponentNode(node->next, filter, parent, editor);
 	}
@@ -1855,7 +1856,7 @@ struct StudioAppImpl final : StudioApp {
 		menuItem("autosnap_down", true);
 		menuItem("package_game", true);
 		for (Action* action = Action::first_action; action; action = action->next) {
-			if (action->type != Action::Type::TOOL) continue;
+			if (action->type != Action::TOOL) continue;
 			if (Lumix::menuItem(*action, true)) action->request = true;
 		}
 		ImGui::EndMenu();
@@ -1956,6 +1957,15 @@ struct StudioAppImpl final : StudioApp {
 			m_toggle_game_mode.toolbarButton(m_big_icon_font, m_editor->isGameMode());
 			m_pause_game.toolbarButton(m_big_icon_font, m_engine->isPaused());
 			m_next_frame.toolbarButton(m_big_icon_font);
+
+			// dropdown menu for next frame options
+			ImGui::SameLine();
+			if (ImGuiEx::IconButton(ICON_FA_CARET_DOWN, "Next frame options")) ImGui::OpenPopup("launch_options_popup");
+			if (ImGui::BeginPopup("launch_options_popup")) {
+				ImGui::MenuItem("Launch app");
+				
+				ImGui::EndPopup();
+			}
 
 			// we don't have custom titlebar on linux
 			#ifdef _WIN32
@@ -2149,29 +2159,7 @@ struct StudioAppImpl final : StudioApp {
 		mvp->DpiScale = 1;
 		mvp->PlatformUserData = (void*)1;
 
-		updateIMGUIMonitors();
-	}
-
-	static void updateIMGUIMonitors() {
-		os::Monitor monitors[32];
-		const u32 monitor_count = os::getMonitors(Span(monitors));
-		ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
-		pio.Monitors.resize(0);
-		for (u32 i = 0; i < monitor_count; ++i) {
-			const os::Monitor& m = monitors[i];
-			ImGuiPlatformMonitor im;
-			im.MainPos = ImVec2((float)m.monitor_rect.left, (float)m.monitor_rect.top);
-			im.MainSize = ImVec2((float)m.monitor_rect.width, (float)m.monitor_rect.height);
-			im.WorkPos = ImVec2((float)m.work_rect.left, (float)m.work_rect.top);
-			im.WorkSize = ImVec2((float)m.work_rect.width, (float)m.work_rect.height);
-
-			if (m.primary) {
-				pio.Monitors.push_front(im);
-			}
-			else {
-				pio.Monitors.push_back(im);
-			}
-		}
+		
 	}
 
 	void beginInitIMGUI() {
@@ -2848,7 +2836,7 @@ struct StudioAppImpl final : StudioApp {
 
 				if (infos.find(hash) < 0) {
 					auto& out_info = infos.emplace(hash);
-					copyString(Span(out_info.path), baked_path);
+					copyString(out_info.path, baked_path);
 					out_info.hash = hash;
 					out_info.size = os::getFileSize(baked_path);
 					out_info.offset = ~0UL;
