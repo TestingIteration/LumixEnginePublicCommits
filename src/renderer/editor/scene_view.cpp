@@ -1249,8 +1249,7 @@ void SceneView::onToolbar()
 	};
 
 	auto pos = ImGui::GetCursorScreenPos();
-	const float toolbar_height = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().FramePadding.y * 2;
-	if (ImGuiEx::BeginToolbar("scene_view_toolbar", pos, ImVec2(0, toolbar_height))) {
+	if (ImGuiEx::BeginToolbar("scene_view_toolbar", pos)) {
 		for (Action* action : actions) {
 			if (action) {
 				action->toolbarButton(m_app.getBigIconFont());
@@ -1272,7 +1271,6 @@ void SceneView::onToolbar()
 	}
 
 	ImGui::PushItemWidth(50);
-	float offset = (toolbar_height - ImGui::GetTextLineHeightWithSpacing()) / 2;
 	
 	Action* mode_action;
 	if (m_app.getGizmoConfig().isTranslateMode()) {
@@ -1296,9 +1294,11 @@ void SceneView::onToolbar()
 	ImGuiEx::VSeparator(3);
 
 	ImGui::SameLine();
+	ImGui::PushFont(m_app.getBigIconFont());
 	ImGui::TextUnformatted(mode_action->font_icon);
+	ImGui::PopFont();
 	ImGui::SameLine();
-	if (ImGui::DragFloat("##gizmoStep", &step, 1.0f, 0, 200)) {
+	if (ImGui::DragFloat("##gizmoStep", &step, 1.0f, 0, 200, "%.4f", ImGuiSliderFlags_NoRoundToFormat)) {
 		m_app.getGizmoConfig().setStep(step);
 	}
 	ImGui::SetItemTooltip("%s", "Snap amount");
@@ -1621,6 +1621,9 @@ void SceneView::onGUI() {
 	if (m_log_ui.getUnreadErrorCount() > 0) title = ICON_FA_GLOBE "Scene View | " ICON_FA_EXCLAMATION_TRIANGLE " errors in log###Scene View";
 
 	bool is_game_mode = m_editor.isGameMode();
+	if (m_was_game_mode && !is_game_mode && m_game_view->m_game_view_merged_with_scene_view) {
+		m_game_view->captureMouse(false);
+	}
 	if (m_game_view->m_game_view_merged_with_scene_view && is_game_mode) {
 		if (!m_was_game_mode) {
 			m_game_view->captureMouse(true);
