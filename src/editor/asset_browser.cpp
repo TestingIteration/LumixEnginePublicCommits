@@ -105,6 +105,7 @@ struct AssetBrowserImpl : AssetBrowser {
 		, m_subdirs(m_allocator)
 		, m_windows(m_allocator)
 		, m_world_asset_plugin(app)
+		, m_readonly_resource_types(m_allocator)
 	{
 		PROFILE_FUNCTION();
 
@@ -118,6 +119,7 @@ struct AssetBrowserImpl : AssetBrowser {
 		settings.registerOption("asset_browser_subresources", &m_show_subresources, "Asset browser", "Show subresources");
 		settings.registerOption("asset_browser_thumbnails", &m_show_thumbnails, "Asset browser", "Show thumbnails");
 		settings.registerOption("asset_browser_thumbnail_size", &m_thumbnail_scale, "Asset browser", "Thumbnail size").setMin(0.01f);
+		m_app.fileChanged().bind<&AssetBrowserImpl::onFileChanged>(this);
 	}
 
 	void onBasePathChanged() override {
@@ -147,6 +149,7 @@ struct AssetBrowserImpl : AssetBrowser {
 	}
 
 	~AssetBrowserImpl() override {
+		m_app.fileChanged().unbind<&AssetBrowserImpl::onFileChanged>(this);
 		removePlugin(m_world_asset_plugin);
 		m_app.getAssetCompiler().removePlugin(m_world_asset_plugin);
 		m_app.getAssetCompiler().listChanged().unbind<&AssetBrowserImpl::onResourceListChanged>(this);
@@ -199,6 +202,16 @@ struct AssetBrowserImpl : AssetBrowser {
 
 		addTile(resource.getPath());
 		sortTiles();
+	}
+
+	void onFileChanged(const char* path) {
+		Path p(path);
+		for (UniquePtr<AssetEditorWindow>& w : m_windows) {
+			if (w->getPath() == p) {
+				w->m_dirty = true;
+				w->fileChangedExternally();
+			}
+		}
 	}
 
 	void onResourceListChanged(const Path& path) {
@@ -477,6 +490,88 @@ struct AssetBrowserImpl : AssetBrowser {
 		ImGui::PopFont();
 
 		ImGui::Dummy(img_size);
+	}
+
+	bool showInOpenFileDialog(ResourceType type) const {
+		return m_readonly_resource_types.indexOf(type) < 0;
+	}
+
+	void openFileUI() {
+		bool focus = false;
+		if (m_app.checkShortcut(m_open_file_action, true)) {
+			ImGui::OpenPopup("Open file");
+			focus = true;
+		}
+		
+		const ImGuiViewport* viewport = ImGui::GetMainViewport();
+		ImVec2 size = viewport->Size;
+		size.x *= 0.4f;
+		size.y *= 0.8f;
+		ImVec2 pos = ImVec2(viewport->Pos.x + (viewport->Size.x - size.x) * 0.5f, viewport->Pos.y + (viewport->Size.y - size.y) * 0.5f);
+		ImGui::SetNextWindowPos(pos);
+		ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+
+		if (ImGui::BeginPopup("Open file", ImGuiWindowFlags_NoNavInputs)) {
+			if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+			
+			m_open_file_filter.gui("Search", -1, focus, nullptr, false);
+
+			AssetCompiler& compiler = m_app.getAssetCompiler();
+			auto& resources = compiler.lockResources();
+			defer { compiler.unlockResources(); };
+			
+			const bool insert_enter = ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter);
+			bool moved = false;
+			if (ImGui::IsItemFocused()) {
+				if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && m_selected_file > 0) {
+					--m_selected_file;
+					moved = true;
+				}
+				if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+					++m_selected_file;
+					moved = true;
+				}
+			}
+
+			ImGui::Separator();
+			i32 idx = 0;
+			if (ImGui::BeginTable("files", 2, ImGuiTableFlags_Resizable)) {
+				ResourceType lua_script_type("lua_script");
+				ResourceType world_type("world");
+				
+				ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+				ImGui::TableSetupColumn("Directory");
+	
+				if (m_open_file_filter.isActive()) {
+					for (const auto& res : resources) {
+						if (!showInOpenFileDialog(res.type)) continue;
+						if (!m_open_file_filter.pass(res.path)) continue;
+
+						PathInfo info(res.path);
+						StaticString<256> tmp(info.basename, ".", info.extension);
+
+						ImGui::TableNextRow();
+						ImGui::TableNextColumn();
+						ImGui::PushID(&res);
+						bool clicked = ImGui::Selectable(tmp.data, idx == m_selected_file, ImGuiSelectableFlags_SpanAllColumns) || (insert_enter && idx == m_selected_file);
+						if (moved && idx == m_selected_file) ImGuiEx::ScrollToItem();
+						ImGui::PopID();
+						ImGui::TableNextColumn();
+						ImGui::TextUnformatted(info.dir.begin, info.dir.end);
+						if (clicked) {
+							openEditor(res.path);
+							ImGui::CloseCurrentPopup();
+						}
+						++idx;
+					}
+				}
+				ImGui::EndTable();
+			}
+
+			if (idx) m_selected_file = m_selected_file % idx;
+
+			ImGui::EndPopup();
+		}
 	}
 
 	bool tileDir(StringView name, StaticString<MAX_PATH>& clamped_name, float size) {
@@ -951,6 +1046,8 @@ struct AssetBrowserImpl : AssetBrowser {
 	}
 
 	void onGUI() override {
+		openFileUI();
+
 		if (m_create_tile_cooldown > 0) {
 			m_create_tile_cooldown -= m_app.getEngine().getLastTimeDelta();
 		}
@@ -1017,6 +1114,7 @@ struct AssetBrowserImpl : AssetBrowser {
 	}
 
 	void removePlugin(IPlugin& plugin) override {
+		if (plugin.isReadOnly()) m_readonly_resource_types.eraseItem(plugin.getResourceType());
 		m_plugins.eraseItem(&plugin);
 		m_plugin_map.eraseIf([&plugin](IPlugin* p){ return p == &plugin; });
 	}
@@ -1036,6 +1134,7 @@ struct AssetBrowserImpl : AssetBrowser {
 	}
 
 	void addPlugin(IPlugin& plugin, Span<const char*> extensions) override {
+		if (plugin.isReadOnly()) m_readonly_resource_types.push(plugin.getResourceType());
 		m_plugins.push(&plugin);
 		for (const char* ext : extensions) {
 			u64 key = 0;
@@ -1398,7 +1497,11 @@ struct AssetBrowserImpl : AssetBrowser {
 	Action m_back_action{"Asset browser", "Back", "Back in history", "asset_browser_back", ICON_FA_ARROW_LEFT};
 	Action m_forward_action{"Asset browser", "Forward", "Forward in history", "asset_browser_forward", ICON_FA_ARROW_RIGHT};
 	Action m_toggle_ui{"Asset browser", "Asset browser", "Toggle UI", "asset_browser_toggle_ui", "", Action::WINDOW};
+	Action m_open_file_action{"General", "Open file", "Open file", "open_file", ""};
+	TextFilter m_open_file_filter;
+	i32 m_selected_file = 0;
 	WorldAssetPlugin m_world_asset_plugin;
+	StackArray<ResourceType, 16> m_readonly_resource_types;
 };
 
 UniquePtr<AssetBrowser> AssetBrowser::create(StudioApp& app) {

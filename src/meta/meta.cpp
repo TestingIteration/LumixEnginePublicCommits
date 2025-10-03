@@ -2,6 +2,7 @@
 #include <float.h>
 #include <Windows.h>
 #include <assert.h>
+#include "meta.h"
 
 #define XXH_STATIC_LINKING_ONLY
 #define XXH_IMPLEMENTATION
@@ -11,85 +12,6 @@
 #define OUT_ENDL "\r\n"
 #define L(...) out.add(__VA_ARGS__, OUT_ENDL)
 
-using i32 = int;
-
-struct NewPlaceholder {};
-inline void* operator new(size_t, NewPlaceholder, void* where) { return where; }
-inline void operator delete(void*, NewPlaceholder,  void*) { } 
-
-struct IAllocator {
-	virtual void* allocate(size_t size) = 0;
-	virtual void deallocate(void* mem) = 0;
-};
-
-template <typename T>
-struct ExpArray {
-	ExpArray(IAllocator& allocator) : allocator(allocator) {}
-	
-	template <typename... Args>
-	T& emplace(Args&&... args) {
-		if (capacity == size) grow();
-		unsigned long m = (size + 4) >> 2;
-		unsigned long chunk = 0;
-		_BitScanReverse(&chunk, (unsigned long)m);
-		i32 chunk_elems = (i32(4) << chunk);
-		i32 start_idx = chunk_elems - 4;
-		i32 offset = size - start_idx;
-		T* res = new (NewPlaceholder(), chunks[chunk] + offset) T(static_cast<Args&&>(args)...);
-		++size;
-		return *res;
-	}
-
-	T& operator[](i32 idx) {
-		unsigned long m = (idx + 4) >> 2;              // Normalize so first 4 indices fall into chunk 0; divides by 4 with bias.
-		unsigned long chunk = 0;
-		_BitScanReverse(&chunk, (unsigned long)m);     // Find position of highest set bit => selects chunk (log2).
-		i32 chunk_elems = (i32(4) << chunk);           // Chunk size = 4 * 2^chunk (sequence: 4,8,16,32,...).
-		i32 start_idx = chunk_elems - 4;               // First global index served by this chunk.
-		i32 offset = idx - start_idx;                  // In-chunk offset of requested element.
-		return chunks[chunk][offset];                  // Return reference to the element within the chunk.
-	}
-
-	T& last() { return (*this)[size - 1]; }
-
-	void grow() {
-		if (size < capacity) return;
-
-		for (int i = 0; i < 20; ++i) {
-			if (!chunks[i]) {
-				i32 chunk_elems = (i32(4) << i);
-				chunks[i] = (T*)allocator.allocate(chunk_elems * sizeof(T));
-				capacity += chunk_elems;
-				return;
-			}
-		}
-	}
-	
-	struct Iterator {
-		ExpArray* array;
-		i32 idx;
-
-		bool operator ==(const Iterator& rhs) const {
-			return array == rhs.array && idx == rhs.idx;
-		}
-
-		void operator++() {
-			++idx;
-		}
-
-		T& operator*() {
-			return (*array)[idx];
-		}
-	};
-
-	Iterator begin() { return { this, 0 }; }
-	Iterator end() { return { this, size }; }
-
-	IAllocator& allocator;
-	T* chunks[20] = {};
-	i32 size = 0;
-	i32 capacity = 0;
-};
 
 struct ArenaAllocator : IAllocator {
 	static constexpr size_t CAPACITY = 1024*1024*1024;
@@ -102,13 +24,13 @@ struct ArenaAllocator : IAllocator {
 	}
 	
 	void* allocate(size_t size) override {
-		if (allocated + size > commited) {
+		if (allocated + size > comitted) {
 			static constexpr size_t PAGE_SIZE = 4096;
 			size_t required = allocated + size;
 			size_t new_commited = (required + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
 			if (new_commited > CAPACITY) return nullptr;
-			if (!VirtualAlloc((char*)mem + commited, new_commited - commited, MEM_COMMIT, PAGE_READWRITE)) return nullptr;
-			commited = new_commited;
+			if (!VirtualAlloc((char*)mem + comitted, new_commited - comitted, MEM_COMMIT, PAGE_READWRITE)) return nullptr;
+			comitted = new_commited;
 		}
 
 		allocated += size;
@@ -119,18 +41,10 @@ struct ArenaAllocator : IAllocator {
 
 	void* mem;
 	size_t allocated = 0;
-	size_t commited = 0;
+	size_t comitted = 0;
 };
 
-struct StringView {
-	const char* begin = nullptr;
-	const char* end = nullptr;
-
-	i32 size() const { return i32(end - begin); }
-	char operator[] (i32 index) { return begin[index]; }
-};
-
-static StringView makeStringView(const char* str) {
+StringView makeStringView(const char* str) {
 	StringView v;
 	v.begin = str;
 	v.end = str + strlen(str);
@@ -163,12 +77,6 @@ StringView find(StringView haystack, StringView needle) {
 StringView find(StringView haystack, const char* needle) {
 	return find(haystack, makeStringView(needle));
 }
-
-template <typename T>
-struct Span {
-	T* begin;
-	T* end;
-};
 
 struct StringBuilder {
 	StringBuilder(char* buffer, i32 capacity)
@@ -274,7 +182,7 @@ static bool endsWith(StringView str, const char* suffix) {
 	return true;
 }
 
-static bool startsWith(StringView str, const char* prefix) {
+bool startsWith(StringView str, const char* prefix) {
 	const char* c = prefix;
 	const char* d = str.begin;
 	while (*c && d != str.end && *c == *d) {
@@ -284,7 +192,7 @@ static bool startsWith(StringView str, const char* prefix) {
 	return !*c;
 }
 
-static bool startsWith(StringView str, StringView prefix) {
+bool startsWith(StringView str, StringView prefix) {
 	const char* c = prefix.begin;
 	const char* d = str.begin;
 	while (c != prefix.end && d != str.end && *c == *d) {
@@ -294,7 +202,7 @@ static bool startsWith(StringView str, StringView prefix) {
 	return c == prefix.end;
 }
 
-static bool equal(StringView lhs, const char* rhs) {
+bool equal(StringView lhs, const char* rhs) {
 	const char* a = lhs.begin;
 	const char* b = rhs;
 	while (*b && a != lhs.end && *a == *b) {
@@ -304,7 +212,7 @@ static bool equal(StringView lhs, const char* rhs) {
 	return !*b && a == lhs.end;
 }
 
-static bool equal(StringView lhs, StringView rhs) {
+bool equal(StringView lhs, StringView rhs) {
 	const char* a = lhs.begin;
 	const char* b = rhs.begin;
 	while (b != rhs.end && a != lhs.end && *a == *b) {
@@ -422,181 +330,61 @@ StringView consumeArgs(StringView& str) {
 	return args;
 }
 
-struct OutputStream {
-	OutputStream() {
-		data = new char[capacity];
-	}
-	~OutputStream() {
-		delete[] data;
-	}
+OutputStream::OutputStream() {
+	data = new char[capacity];
+}
 
-	void consume(OutputStream& rhs) {
-		delete[] data;
-		data = rhs.data;
-		capacity = rhs.capacity;
-		length = rhs.length;
-		rhs.data = nullptr;
-		rhs.capacity = 0;
-		rhs.length = 0;
-	}
+OutputStream::~OutputStream() {
+	delete[] data;
+}
 
-	template <typename... Args>
-	void add(Args... args) {
-		(append(args), ...);
-	}
+void OutputStream::consume(OutputStream& rhs) {
+	delete[] data;
+	data = rhs.data;
+	capacity = rhs.capacity;
+	length = rhs.length;
+	rhs.data = nullptr;
+	rhs.capacity = 0;
+	rhs.length = 0;
+}
 
-	void append(const char* v) {
-		append(makeStringView(v));
-	}
+void OutputStream::append(const char* v) {
+	append(makeStringView(v));
+}
 
-	void append(XXH64_hash_t hash) {
-		char cstr[32] = "";
-		_ui64toa_s(hash, cstr, sizeof(cstr), 10);
-		append(makeStringView(cstr));
-	}
+void OutputStream::append(XXH64_hash_t hash) {
+	char cstr[32] = "";
+	_ui64toa_s(hash, cstr, sizeof(cstr), 10);
+	append(makeStringView(cstr));
+}
 
-	void append(i32 value) {
-		char cstr[32] = "";
-		_itoa_s(value, cstr, 10);
-		append(makeStringView(cstr));
-	}
+void OutputStream::append(i32 value) {
+	char cstr[32] = "";
+	_itoa_s(value, cstr, 10);
+	append(makeStringView(cstr));
+}
 
-	void reserve(i32 size) {
-		if (capacity >= size) return;
+void OutputStream::reserve(i32 size) {
+	if (capacity >= size) return;
 
-		capacity = size;
+	capacity = size;
+	char* new_data = new char[capacity];
+	memcpy(new_data, data, length);
+	delete[] data;
+	data = new_data;
+}
+
+void OutputStream::append(StringView v) {
+	if (capacity < length + v.size()) {
+		capacity = (length + v.size()) * 2;
 		char* new_data = new char[capacity];
 		memcpy(new_data, data, length);
 		delete[] data;
 		data = new_data;
 	}
-
-	void append(StringView v) {
-		if (capacity < length + v.size()) {
-			capacity = (length + v.size()) * 2;
-			char* new_data = new char[capacity];
-			memcpy(new_data, data, length);
-			delete[] data;
-			data = new_data;
-		}
-		memcpy(data + length, v.begin, v.size());
-		length += v.size();
-	}
-
-	char* data;
-	i32 capacity = 64 * 1024;
-	i32 length = 0;
-};
-
-struct Attributes {
-	StringView alias;
-	StringView label;
-	StringView min;
-	StringView clamp_max;
-	StringView resource_type;
-	StringView property_name;
-	StringView dynamic_enum_name;
-	bool no_ui = false;
-	bool is_radians = false;
-	bool is_color = false;
-	bool force_function = false;
-	bool force_getter = false;
-	bool force_setter = false;
-	bool is_multiline = false;
-};
-
-struct Property {
-	StringView name;
-	StringView type;
-	StringView getter_name;
-	StringView setter_name;
-	StringView getter_args;
-	StringView setter_args;
-	Attributes attributes;
-	bool is_var = false;
-};
-
-struct Function {
-	StringView return_type;
-	StringView name;
-	StringView args;
-	Attributes attributes;
-};
-
-struct ArrayProperty {
-	ArrayProperty(IAllocator& allocator) : children(allocator) {}
-	StringView id;
-	StringView name;
-	ExpArray<Property> children;
-};
-
-struct Component {
-	Component(IAllocator& allocator)
-		: functions(allocator)
-		, properties(allocator)
-		, arrays(allocator)
-	{}
-	// name used to detect properties, e.g. if name =="Decal", function `void setDecalMaterialPath(...);` is
-	// considered setter for property `MaterialPath` on component `Decal`
-	StringView name;
-	StringView struct_name;		// e.g., it's `NavmeshZone` in case of `struct NavmeshZone { ...`
-	StringView id;				// ComponentType
-	StringView label;			// how it's shown in UI
-	StringView icon;
-	ExpArray<Function> functions;
-	ExpArray<Property> properties;
-	ExpArray<ArrayProperty> arrays;
-};
-
-struct Enumerator {
-	StringView name;
-	i32 value;
-};
-
-struct Enum {
-	Enum(IAllocator& allocator) : values(allocator) {}
-	StringView name;
-	StringView full;
-	ExpArray<Enumerator> values;
-};
-
-struct StructVar {
-	StringView type;
-	StringView name;
-};
-
-struct Object {
-	Object(IAllocator& allocator) : functions(allocator) {}
-	StringView name;
-	char* filename;
-	ExpArray<Function> functions;
-};
-
-struct Struct {
-	Struct(IAllocator& allocator) : vars(allocator) {}
-	StringView name;
-	ExpArray<StructVar> vars;
-};
-
-
-struct Module {
-	Module(IAllocator& allocator) 
-		: components(allocator)
-		, functions(allocator)
-		, events(allocator)
-		, enums(allocator)
-		, includes(allocator)
-		{}
-	StringView name;
-	StringView id;
-	StringView label;
-	char* filename;
-	ExpArray<Component> components;
-	ExpArray<Function> functions;
-	ExpArray<StringView> events;
-	ExpArray<Enum> enums;
-	ExpArray<StringView> includes;
-};
+	memcpy(data + length, v.begin, v.size());
+	length += v.size();
+}
 
 bool readLine(StringView& content, StringView& line) {
 	if (content.size() == 0) return false;
@@ -1470,7 +1258,7 @@ Object* getObject(StringView name) {
 	return nullptr;
 }
 
-Enum* getEnum(Module& m, StringView name) {
+static Enum* getEnum(Module& m, StringView name) {
 	for (Enum& e : parser.enums) {
 		if (equal(e.name, name)) return &e;
 		if (equal(e.full, name)) return &e;
@@ -1481,14 +1269,6 @@ Enum* getEnum(Module& m, StringView name) {
 	}
 	return nullptr;
 }
-
-struct Arg {
-	StringView type;
-	StringView name;
-	bool is_const = false;
-	bool is_ref = false;
-};
-
 
 bool consumeArg(StringView& line, Arg& out) {
 	line = skipWhitespaces(line);
@@ -1508,16 +1288,6 @@ bool consumeArg(StringView& line, Arg& out) {
 	word = consumeWord(line);
 	out.name = word;
 	return true;
-}
-
-template <typename F>
-void forEachArg(StringView args, F f) {
-	Arg arg;
-	bool first_arg = true;
-	while (consumeArg(args, arg)) {
-		f(arg, first_arg);
-		first_arg = false;
-	}
 }
 
 Struct* findStruct(StringView struct_name) {
@@ -1771,7 +1541,7 @@ void serializeMain(OutputStream& out, Parser& parser) {
 	
 	for (Module& m : parser.modules) {
 		for (Component& c : m.components) {
-			L("\tregisterLuaComponent(L, \"",c.id,"\", ",c.name,"_getter, ",c.name,"_setter);");
+			L("\tregisterLuaComponent(L, \"",c.id,"\", ",c.id,"_getter, ",c.id,"_setter);");
 		}
 	}
 	L("}");
@@ -1785,7 +1555,7 @@ bool isBlob(const Property& p) {
 }
 
 void serializeLuaPropertySetter(OutputStream& out, Module& m, Component& c) {
-	L("int ",c.name,"_setter(lua_State* L) {");
+	L("int ",c.id,"_setter(lua_State* L) {");
 	L("auto [imodule, entity] = checkComponent(L);");
 	L("auto* module = (",m.name,"*)imodule;");
 	L("const char* prop_name = LuaWrapper::checkArg<const char*>(L, 2);");
@@ -1956,7 +1726,7 @@ void serializeLuaArrayGetter(OutputStream& out, Module& m, Component& c, ArrayPr
 
 // TODO move lua stuff into separate file
 void serializeLuaPropertyGetter(OutputStream& out, Module& m, Component& c) {
-	L("int ",c.name,"_getter(lua_State* L) {");
+	L("int ",c.id,"_getter(lua_State* L) {");
 	L("\tauto [imodule, entity] = checkComponent(L);");
 	L("\tauto* module = (",m.name,"*)imodule;");
 
@@ -2061,19 +1831,13 @@ StringView toLuaType(StringView ctype) {
 
 void serializeLuaType(OutputStream& out, StringView self_type, const char* self_type_suffix, Function& f, bool skip_first_arg) {
 	out.add("\t",pickLabel(f.name, f.attributes.alias),": (");
+	out.add(self_type,self_type_suffix);
 	forEachArg(f.args, [&](const Arg& arg, bool first){
-		if (!first) out.add(", ");
-		if (first) {
-			out.add(self_type,self_type_suffix);
-			if (!skip_first_arg) {
-				out.add(", ", toLuaType(arg.type));
-			}
-		}
-		else {
-			out.add(toLuaType(arg.type));
+		if (!first || !skip_first_arg) {
+			out.add(", ", toLuaType(arg.type));
 		}
 	});
-	out.add(") -> ",toLuaType(f.return_type),OUT_ENDL);
+	out.add(") -> ",toLuaType(f.return_type), "," OUT_ENDL);
 }
 
 void serializeLuaTypes(OutputStream& out_formatted) {
@@ -2152,85 +1916,97 @@ void serializeLuaTypes(OutputStream& out_formatted) {
 		Key_UpArrow : number
 	}
 
-	declare class World
-		getActivePartition : (World) -> number
-		setActivePartition : (World, number) -> ()
-		createPartition : (World, string) -> number
-		load : (World, string, any) -> ()
-		getModule : (string) -> any
-		createEntity : () -> Entity
-		createEntityEx : (any) -> Entity
-		findEntityByName : (string) -> Entity
+	export type Resource = {
+		newEmpty: (Resource, string) -> Resource,
+		getPath: (Resource) -> string,
+		path : string,
+	}
+
+	declare Lumix : {
+		Resource : Resource,
+		Entity : Entity
+	}
+
+	export type World = {
+		getActivePartition : (World) -> number,
+		setActivePartition : (World, number) -> (),
+		createPartition : (World, string) -> number,
+		destroyPartition : (World, number) -> (),
+		load : (World, string, any) -> (),
+		getModule : (World, string) -> any,
+		createEntity : (World) -> Entity,
+		createEntityEx : (World, any) -> Entity,
+		findEntityByName : (World, Entity, string) -> Entity,
 	)#");
 
 	for (Module& m : parser.modules) {
-		L(m.id,": ",m.id,"_module");
+		L(m.id,": ",m.id,"_module,");
 	}
 
-	L("end" OUT_ENDL);
+	L("}" OUT_ENDL);
 
 	for (Struct& s : parser.structs) {
-		L("declare class ",s.name);
+		L("type ",s.name, " = {");
 		for (StructVar& v : s.vars) {
-			L(v.name,": ",toLuaType(v.type));
+			L(v.name,": ",toLuaType(v.type), ",");
 		}
-		L("end" OUT_ENDL);
+		L("}" OUT_ENDL);
 	}
 
 	for (Object& o : parser.objects) {
-		L("declare class ",o.name);
+		L("type ",o.name, " = {");
 		for (Function& f : o.functions) {
 			serializeLuaType(out, o.name, "", f, false);
 		}
-		L("end" OUT_ENDL);
+		L("}" OUT_ENDL);
 	}
 
 	for (Module& m : parser.modules) {
-		L("declare class ",m.id,"_module");
+		L("type ",m.id,"_module = {");
 		for (Function& f : m.functions) {
 			serializeLuaType(out, m.id, "_module", f, false);
 		}
-		L("end" OUT_ENDL);
+		L("}" OUT_ENDL);
 		
 		for (Component& c : m.components) {
-			L("declare class ",c.id,"_component");
+			L("type ",c.id,"_component =  {");
 			for (Property& p : c.properties) {
-				
 				char tmp[256];
 				toID(p.name, Span(tmp, tmp + 256));
-				if (!isBlob(p) && p.type.size() > 0) L("	",tmp,": ", toLuaType(p.type));
+				if (!isBlob(p) && p.type.size() > 0) L("	",tmp,": ", toLuaType(p.type), ",");
 			}
 			for (Function& f : c.functions) {
 				serializeLuaType(out, c.id, "_component", f, true);
 			}
-			L("end" OUT_ENDL);
+			L("}" OUT_ENDL);
 		}
 	}
 
 	out.add(R"#(
-	declare class Entity 
-		world : World
-		name : string
-		parent : Entity?
-		rotation : any
-		position : Vec3
-		scale : Vec3
-		hasComponent : (Entity, any) -> boolean
-		getComponent : (Entity, any) -> any
-		destroy : (Entity) -> ()
-		createComponent : (Entity, any) -> any
+	export type Entity = {
+		NULL : Entity,
+		world : World,
+		name : string,
+		parent : Entity?,
+		rotation : any,
+		position : Vec3,
+		scale : Vec3,
+		hasComponent : (Entity, any) -> boolean,
+		getComponent : (Entity, any) -> any,
+		destroy : (Entity) -> (),
+		createComponent : (Entity, any) -> any,
 	)#");
 
 	for (Module& m : parser.modules) {
 		for (Component& c : m.components) {
-			L(c.id,": ",c.id,"_component");
+			L(c.id,": ",c.id,"_component,");
 		}
 	}
 	
-	L("end" OUT_ENDL);
+	L("}" OUT_ENDL);
 
 	out.add(R"#(
-	declare this:Entity
+	declare this : Entity
 
 	type ActionDesc = {
 		name : string,
@@ -2254,10 +2030,7 @@ void serializeLuaTypes(OutputStream& out_formatted) {
 	}
 
 	declare LumixAPI: {
-		RaycastHit : { create : () -> RaycastHit, destroy : (RaycastHit) -> () },
-		SweepHit : { create : () -> SweepHit, destroy : (SweepHit) -> () },
-		Ray : { create : () -> Ray, destroy : (Ray) -> () },
-		RayCastModelHit : { create : () -> RayCastModelHit, destroy : (RayCastModelHit) -> () },
+		hasFilesystemWork : () -> boolean,
 
 		INPUT_KEYCODE_SHIFT: number,
 		INPUT_KEYCODE_LEFT : number,
@@ -2538,6 +2311,17 @@ int main() {
 
 	writeFile("src/lua/lua_capi.gen.h", lua_capi_stream);
 	writeFile("data/scripts/lumix.d.lua", lua_d_stream);
+
+	MetaData metadata = {
+		parser.modules,
+		parser.structs,
+		parser.objects,
+		parser.enums
+	};
+	
+	for (MetaPluginRegister* r = MetaPluginRegister::first; r; r = r->next) {
+		(r->fn)(metadata);
+	}
 
 	QueryPerformanceCounter(&stop);
 	QueryPerformanceFrequency(&freq);

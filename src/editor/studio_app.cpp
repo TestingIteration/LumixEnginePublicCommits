@@ -575,6 +575,7 @@ struct StudioAppImpl final : StudioApp {
 		, m_dir_selector(*this)
 		, m_export(m_allocator)
 		, m_recent_folders(m_allocator)
+		, m_file_changed(m_allocator)
 	{
 		PROFILE_FUNCTION();
 		u32 cpus_count = minimum(os::getCPUsCount(), 64);
@@ -671,15 +672,21 @@ struct StudioAppImpl final : StudioApp {
 		jobs::shutdown();
 	}
 
+	bool isFocused() const {
+		const os::WindowHandle focused = os::getFocused();
+		const int idx = m_windows.find([focused](os::WindowHandle w){ return w == focused; });
+		return idx >= 0;
+	}
+
 	void onEvent(const os::Event& event)
 	{
-		const bool handle_input = isFocused();
+		const bool handle_input = m_frames_since_foreground == 0;
 		m_events.push(event);
 		switch (event.type) {
 			case os::Event::Type::MOUSE_MOVE: break;
 			case os::Event::Type::FOCUS: {
 				ImGuiIO& io = ImGui::GetIO();
-				io.AddFocusEvent(isFocused());
+				io.AddFocusEvent(m_frames_since_foreground == 0);
 				break;
 			}
 			case os::Event::Type::MOUSE_BUTTON: {
@@ -742,12 +749,6 @@ struct StudioAppImpl final : StudioApp {
 				}
 				break;
 		}
-	}
-
-	bool isFocused() const {
-		const os::WindowHandle focused = os::getFocused();
-		const int idx = m_windows.find([focused](os::WindowHandle w){ return w == focused; });
-		return idx >= 0;
 	}
 
 	void onShutdown() {
@@ -818,7 +819,7 @@ struct StudioAppImpl final : StudioApp {
 		m_engine->update(*m_editor->getWorld());
 
 		++m_fps_frame;
-		if (m_fps_timer.getTimeSinceTick() > 1.0f) {
+		if (m_fps_timer.getTimeSinceTick() > 0.5f) {
 			m_fps = m_fps_frame / m_fps_timer.tick();
 			m_fps_frame = 0;
 		}
@@ -851,10 +852,10 @@ struct StudioAppImpl final : StudioApp {
 			m_first_update = false;
 		}
 
-		if (!isFocused()) ++m_frames_since_focused;
-		else m_frames_since_focused = 0;
+		if (os::isAppForeground()) m_frames_since_foreground = 0;
+		else ++m_frames_since_foreground;
 
-		if (m_sleep_when_inactive && m_frames_since_focused > 10) {
+		if (m_sleep_when_inactive && m_frames_since_foreground > 10) {
 			const float frame_time = m_inactive_fps_timer.tick();
 			const float wanted_fps = 5.0f;
 
@@ -949,14 +950,19 @@ struct StudioAppImpl final : StudioApp {
 		};
 		init_data.plugins = Span(plugins, plugins + lengthOf(plugins) - 1);
 		m_engine = Engine::create(static_cast<Engine::InitArgs&&>(init_data), m_allocator);
+		FileSystem& fs = m_engine->getFileSystem();
+		const char* base_path = fs.getBasePath();
+		m_file_watcher = FileSystemWatcher::create(base_path, m_allocator);
+		m_file_watcher->getCallback().bind<&StudioAppImpl::onFileChanged>(this);
 		
 		m_settings.registerOption("command_pallete_search_settings", &m_command_palette_search_settings, "General", "Command palette searches in settings");
 		m_settings.registerOption("welcome_shader", &m_welcome_screen_use_shader, "General", "Animated background in welcome screen");
 		m_settings.registerOption("report_crashes", &m_crash_reporting, "General", "Report crashes");
-		m_settings.registerOption("sleep_when_inactive", &m_sleep_when_inactive, "General", "Sleep when inactive");
+		m_settings.registerOption("sleep_when_inactive", &m_sleep_when_inactive, "General", "Throttle FPS in background");
 		m_settings.registerOption("fileselector_dir", &m_file_selector.m_path);
 		m_settings.registerOption("font_size", &m_font_size, "General", "Font size").setMin(1);
-		m_settings.registerOption("code_editor_font_size", &CodeEditor::s_font_size, "General", "Code editor font size").setMin(1);
+		m_settings.registerOption("code_editor_font_size", &CodeEditor::s_font_size, "Code editor", "Font size").setMin(1);
+		m_settings.registerOption("code_editor_show_line_nums", &CodeEditor::s_show_line_numbers, "Code editor", "Show line numbers");
 		m_settings.registerOption("export_pack", &m_export.pack);
 		m_settings.registerOption("export_dir", &m_export.dest_dir);
 		m_settings.registerOption("gizmo_scale", &m_gizmo_config.scale, "General", "Gizmo scale").setMin(0.001f);
@@ -1411,6 +1417,9 @@ struct StudioAppImpl final : StudioApp {
 		m_editor->resetChangedFlag();
 	}
 
+	DelegateList<void(const char*)>& fileChanged() override { return m_file_changed; }
+
+
 	void tryLoadWorld(const Path& path, bool additive) override {
 		if (!additive && m_editor->isWorldChanged()) {
 			m_world_to_load = path;
@@ -1437,6 +1446,9 @@ struct StudioAppImpl final : StudioApp {
 	}
 
 	void changeBasePath(const char* dir) {
+		m_file_watcher = FileSystemWatcher::create(dir, m_allocator);
+		m_file_watcher->getCallback().bind<&StudioAppImpl::onFileChanged>(this);
+
 		m_engine->getFileSystem().setBasePath(dir);
 		extractBundled();
 		m_editor->loadProject();
@@ -1446,6 +1458,10 @@ struct StudioAppImpl final : StudioApp {
 		initDefaultWorld();
 		loadSettings();
 		ImGui::LoadIniSettingsFromMemory(m_settings.m_imgui_state.c_str());
+	}
+
+	void onFileChanged(const char* path) {
+		m_file_changed.invoke(path);
 	}
 
 	#ifdef STATIC_PLUGINS
@@ -1973,7 +1989,7 @@ struct StudioAppImpl final : StudioApp {
 				StaticString<200> stats;
 				if (m_engine->getFileSystem().hasWork()) stats.append(ICON_FA_HOURGLASS_HALF "Loading... | ");
 				stats.append("FPS: ", u32(m_fps + 0.5f));
-				if (m_frames_since_focused > 10) stats.append(" - inactive window");
+				if (m_frames_since_foreground > 10) stats.append(" - background app");
 
 				if (!m_use_native_titlebar) {
 					alignGUIRight([&](){
@@ -2578,7 +2594,11 @@ struct StudioAppImpl final : StudioApp {
 		}
 
 		for (const reflection::RegisteredComponent& cmp : reflection::getComponents()) {
-			ASSERT(cmp.cmp->component_type != INVALID_COMPONENT_TYPE);
+			if (!cmp.cmp) {
+				// if we have code like `static const ComponentType MESH_ACTOR_TYPE = reflection::getComponentType("rigid_actor");`
+				// without having the plugin compiled, cmp.cmp is nullptr, which is fine
+				continue;
+			}
 			const reflection::ComponentBase* r = cmp.cmp;
 			
 			if (m_component_labels.find(r->component_type).isValid()) continue;
@@ -2616,6 +2636,7 @@ struct StudioAppImpl final : StudioApp {
 		Span<const reflection::RegisteredComponent> cmps = reflection::getComponents();
 		u32 idx = start_idx;
 		for (const reflection::RegisteredComponent& cmp : cmps) {
+			if (!cmp.cmp) continue;
 			if (!m_all_actions_filter.pass(cmp.cmp->label)) continue;
 
 			ImGui::PushID(&cmp);
@@ -3065,7 +3086,7 @@ struct StudioAppImpl final : StudioApp {
 	UniquePtr<WorldEditor> m_editor;
 	ImGuiKey m_imgui_key_map[255];
 	Array<os::WindowHandle> m_windows;
-	u32 m_frames_since_focused = 0;
+	u32 m_frames_since_foreground = 0;
 	Array<WindowToDestroy> m_deferred_destroy_windows;
 	os::WindowHandle m_main_window;
 	os::WindowState m_fullscreen_restore_state;
@@ -3178,6 +3199,8 @@ struct StudioAppImpl final : StudioApp {
 	bool m_welcome_screen_use_shader = true;
 	bool m_command_palette_search_settings = true;
 	i32 m_font_size = 16;
+	DelegateList<void(const char*)> m_file_changed;
+	UniquePtr<FileSystemWatcher> m_file_watcher;
 };
 
 static Local<StudioAppImpl> g_studio;
